@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import time
+import argparse
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -13,14 +14,26 @@ class WhisperBatchTranscriber:
     def __init__(
         self,
         input_dir: str,
-        output_dir: str,
+        output_dir: str = None,
         model_size: str = "base",
-        progress_file: str = "transcription_progress.json",
+        progress_file: str = None,
     ):
         self.input_dir = Path(input_dir)
-        self.output_dir = Path(output_dir)
+        
+        # Auto-generate output dir based on input folder name
+        if output_dir is None:
+            self.output_dir = self.input_dir.parent / f"{self.input_dir.name}_transcriptions"
+        else:
+            self.output_dir = Path(output_dir)
+        
         self.output_dir.mkdir(exist_ok=True)
-        self.progress_file = Path(progress_file)
+        
+        # Progress file lives in output dir by default
+        if progress_file is None:
+            self.progress_file = self.output_dir / "transcription_progress.json"
+        else:
+            self.progress_file = Path(progress_file)
+        
         self.model_size = model_size
 
         # Set up logging
@@ -42,6 +55,8 @@ class WhisperBatchTranscriber:
         self.logger.info(f"Loading Whisper model: {model_size}")
         self.model = whisper.load_model(model_size)
         self.logger.info("Model loaded successfully")
+        self.logger.info(f"Input directory: {self.input_dir}")
+        self.logger.info(f"Output directory: {self.output_dir}")
 
     def _load_progress(self) -> dict:
         """Load progress from JSON file or create new progress dict"""
@@ -82,7 +97,7 @@ class WhisperBatchTranscriber:
             result = self.model.transcribe(
                 str(wav_file),
                 verbose=False,
-                language="en",  # Remove this if you have non-English audio
+                language="en",
             )
 
             # Create subdirectories for organized output
@@ -125,10 +140,16 @@ class WhisperBatchTranscriber:
             self.logger.error(f"Failed to process {wav_file.name}: {str(e)}")
             return {"success": False, "error": str(e)}
 
-    def process_batch(self, skip_completed: bool = True):
+    def process_batch(self, skip_completed: bool = True, recursive: bool = False):
         """Process all WAV files in the input directory"""
+        batch_start_time = time.time()
+        
         # Find all WAV files
-        wav_files = list(self.input_dir.glob("*.wav"))
+        if recursive:
+            wav_files = list(self.input_dir.rglob("*.wav"))
+        else:
+            wav_files = list(self.input_dir.glob("*.wav"))
+        
         total_files = len(wav_files)
 
         if total_files == 0:
@@ -179,6 +200,9 @@ class WhisperBatchTranscriber:
             # Save progress after each file
             self._save_progress()
 
+        # Calculate actual batch elapsed time
+        batch_elapsed = time.time() - batch_start_time
+
         # Final summary
         self.logger.info("=" * 60)
         self.logger.info("BATCH PROCESSING COMPLETE")
@@ -186,9 +210,7 @@ class WhisperBatchTranscriber:
         self.logger.info(f"Newly processed: {processed_count}")
         self.logger.info(f"Skipped (already done): {skipped_count}")
         self.logger.info(f"Failed: {failed_count}")
-        self.logger.info(
-            f"Total processing time: {self.progress['stats']['total_time_seconds']:.2f} seconds"
-        )
+        self.logger.info(f"This batch took: {batch_elapsed:.2f} seconds ({batch_elapsed/60:.1f} minutes)")
         self.logger.info("=" * 60)
 
     def _format_timestamp(self, seconds: float) -> str:
@@ -244,6 +266,8 @@ class WhisperBatchTranscriber:
             f.write("TRANSCRIPTION BATCH REPORT\n")
             f.write("=" * 60 + "\n\n")
             f.write(f"Model used: {self.model_size}\n")
+            f.write(f"Input directory: {self.input_dir}\n")
+            f.write(f"Output directory: {self.output_dir}\n")
             f.write(
                 f"Total files processed: {self.progress['stats']['total_processed']}\n"
             )
@@ -264,23 +288,65 @@ class WhisperBatchTranscriber:
         self.logger.info(f"Report generated: {report_file}")
 
 
-# Example usage
-if __name__ == "__main__":
-    # Configuration
-    INPUT_DIR = "./wav_files"  # Directory containing WAV files
-    OUTPUT_DIR = "./transcriptions"  # Directory for output text files
-    MODEL_SIZE = "base"  # Options: tiny, base, small, medium, large
-
-    # Create transcriber
-    transcriber = WhisperBatchTranscriber(
-        input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, model_size=MODEL_SIZE
+def main():
+    # Ensure input directory exists
+    script_dir = Path(__file__).parent
+    default_input = script_dir / "input_files"
+    default_input.mkdir(exist_ok=True)
+    
+    parser = argparse.ArgumentParser(
+        description="Batch transcribe WAV files using Whisper"
+    )
+    parser.add_argument(
+        "input_folder",
+        nargs="?",
+        default=str(default_input),
+        help="Path to folder containing WAV files (default: ./input_files)"
+    )
+    parser.add_argument(
+        "-o", "--output",
+        help="Output directory (default: <input_folder>_transcriptions)",
+        default=None
+    )
+    parser.add_argument(
+        "-m", "--model",
+        help="Whisper model size (tiny, base, small, medium, large)",
+        default="base"
+    )
+    parser.add_argument(
+        "-r", "--recursive",
+        help="Search for WAV files recursively in subdirectories",
+        action="store_true"
+    )
+    parser.add_argument(
+        "--retry",
+        help="Retry previously failed files",
+        action="store_true"
+    )
+    parser.add_argument(
+        "--no-skip",
+        help="Reprocess already completed files",
+        action="store_true"
     )
 
-    # Process all files (will skip already completed ones)
-    transcriber.process_batch(skip_completed=True)
+    args = parser.parse_args()
 
-    # Optional: Retry any failed files
-    # transcriber.retry_failed()
+    transcriber = WhisperBatchTranscriber(
+        input_dir=args.input_folder,
+        output_dir=args.output,
+        model_size=args.model,
+    )
 
-    # Generate final report
+    if args.retry:
+        transcriber.retry_failed()
+    else:
+        transcriber.process_batch(
+            skip_completed=not args.no_skip,
+            recursive=args.recursive
+        )
+
     transcriber.generate_report()
+
+
+if __name__ == "__main__":
+    main()
