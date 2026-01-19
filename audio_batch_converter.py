@@ -14,26 +14,14 @@ class WhisperBatchTranscriber:
     def __init__(
         self,
         input_dir: str,
-        output_dir: str = None,
+        output_dir: str,
         model_size: str = "base",
-        progress_file: str = None,
     ):
         self.input_dir = Path(input_dir)
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Auto-generate output dir based on input folder name
-        if output_dir is None:
-            self.output_dir = self.input_dir.parent / f"{self.input_dir.name}_transcriptions"
-        else:
-            self.output_dir = Path(output_dir)
-        
-        self.output_dir.mkdir(exist_ok=True)
-        
-        # Progress file lives in output dir by default
-        if progress_file is None:
-            self.progress_file = self.output_dir / "transcription_progress.json"
-        else:
-            self.progress_file = Path(progress_file)
-        
+        self.progress_file = self.output_dir / "transcription_progress.json"
         self.model_size = model_size
 
         # Set up logging
@@ -87,6 +75,14 @@ class WhisperBatchTranscriber:
         file_hash = self._get_file_hash(wav_file)
         return file_hash in self.progress["completed"]
 
+    def _get_relative_output_path(self, wav_file: Path) -> Path:
+        """Get the output path preserving directory structure"""
+        try:
+            relative = wav_file.parent.relative_to(self.input_dir)
+        except ValueError:
+            relative = Path(".")
+        return relative
+
     def transcribe_file(self, wav_file: Path) -> Optional[dict]:
         """Transcribe a single WAV file"""
         try:
@@ -100,14 +96,17 @@ class WhisperBatchTranscriber:
                 language="en",
             )
 
-            # Create subdirectories for organized output
-            plain_text_dir = self.output_dir / "plain_text"
-            timestamped_dir = self.output_dir / "timestamped"
-            json_dir = self.output_dir / "json"
+            # Get relative path for preserving structure
+            relative_path = self._get_relative_output_path(wav_file)
 
-            plain_text_dir.mkdir(exist_ok=True)
-            timestamped_dir.mkdir(exist_ok=True)
-            json_dir.mkdir(exist_ok=True)
+            # Create subdirectories for organized output
+            plain_text_dir = self.output_dir / "plain_text" / relative_path
+            timestamped_dir = self.output_dir / "timestamped" / relative_path
+            json_dir = self.output_dir / "json" / relative_path
+
+            plain_text_dir.mkdir(parents=True, exist_ok=True)
+            timestamped_dir.mkdir(parents=True, exist_ok=True)
+            json_dir.mkdir(parents=True, exist_ok=True)
 
             # Save plain text transcription
             txt_file = plain_text_dir / f"{wav_file.stem}_transcript.txt"
@@ -140,15 +139,12 @@ class WhisperBatchTranscriber:
             self.logger.error(f"Failed to process {wav_file.name}: {str(e)}")
             return {"success": False, "error": str(e)}
 
-    def process_batch(self, skip_completed: bool = True, recursive: bool = False):
-        """Process all WAV files in the input directory"""
+    def process_batch(self, skip_completed: bool = True):
+        """Process all WAV files in the input directory recursively"""
         batch_start_time = time.time()
         
-        # Find all WAV files
-        if recursive:
-            wav_files = list(self.input_dir.rglob("*.wav"))
-        else:
-            wav_files = list(self.input_dir.glob("*.wav"))
+        # Find all WAV files recursively
+        wav_files = list(self.input_dir.rglob("*.wav"))
         
         total_files = len(wav_files)
 
@@ -181,6 +177,7 @@ class WhisperBatchTranscriber:
             if result["success"]:
                 self.progress["completed"][file_hash] = {
                     "filename": wav_file.name,
+                    "path": str(wav_file),
                     "processed_at": datetime.now().isoformat(),
                     "duration_seconds": result["duration"],
                     "text_length": result["text_length"],
@@ -191,6 +188,7 @@ class WhisperBatchTranscriber:
             else:
                 self.progress["failed"][file_hash] = {
                     "filename": wav_file.name,
+                    "path": str(wav_file),
                     "failed_at": datetime.now().isoformat(),
                     "error": result["error"],
                 }
@@ -231,21 +229,22 @@ class WhisperBatchTranscriber:
         self.logger.info(f"Retrying {len(failed_files)} failed files")
 
         for file_hash, info in failed_files.items():
-            filename = info["filename"]
-            wav_file = self.input_dir / filename
+            filepath = info.get("path", self.input_dir / info["filename"])
+            wav_file = Path(filepath)
 
             if not wav_file.exists():
-                self.logger.warning(f"File not found: {filename}")
+                self.logger.warning(f"File not found: {wav_file}")
                 continue
 
-            self.logger.info(f"Retrying: {filename}")
+            self.logger.info(f"Retrying: {wav_file.name}")
             result = self.transcribe_file(wav_file)
 
             if result["success"]:
                 # Remove from failed, add to completed
                 del self.progress["failed"][file_hash]
                 self.progress["completed"][file_hash] = {
-                    "filename": filename,
+                    "filename": wav_file.name,
+                    "path": str(wav_file),
                     "processed_at": datetime.now().isoformat(),
                     "duration_seconds": result["duration"],
                     "text_length": result["text_length"],
@@ -288,35 +287,131 @@ class WhisperBatchTranscriber:
         self.logger.info(f"Report generated: {report_file}")
 
 
+def process_input_files(script_dir: Path, output_base: Path, model_size: str, retry: bool, no_skip: bool):
+    """Process all folders and loose files in input_files/"""
+    input_base = script_dir / "input_files"
+    
+    # Get all top-level items in input_files
+    top_level_items = list(input_base.iterdir()) if input_base.exists() else []
+    
+    # Separate folders and loose wav files
+    folders = [item for item in top_level_items if item.is_dir()]
+    loose_wavs = list(input_base.glob("*.wav"))
+    
+    # Process each folder as its own batch
+    for folder in folders:
+        output_dir = output_base / f"{folder.name}_transcribed"
+        print(f"\n{'='*60}")
+        print(f"Processing folder: {folder.name}")
+        print(f"Output: {output_dir}")
+        print(f"{'='*60}\n")
+        
+        transcriber = WhisperBatchTranscriber(
+            input_dir=str(folder),
+            output_dir=str(output_dir),
+            model_size=model_size,
+        )
+        
+        if retry:
+            transcriber.retry_failed()
+        else:
+            transcriber.process_batch(skip_completed=not no_skip)
+        
+        transcriber.generate_report()
+    
+    # Process loose wav files if any
+    if loose_wavs:
+        output_dir = output_base / "loose_files_transcribed"
+        print(f"\n{'='*60}")
+        print(f"Processing loose WAV files in input_files/")
+        print(f"Output: {output_dir}")
+        print(f"{'='*60}\n")
+        
+        transcriber = WhisperBatchTranscriber(
+            input_dir=str(input_base),
+            output_dir=str(output_dir),
+            model_size=model_size,
+        )
+        
+        # Only process files directly in input_files, not in subfolders
+        # We need to temporarily override to non-recursive for loose files
+        wav_files = list(input_base.glob("*.wav"))
+        if wav_files:
+            if retry:
+                transcriber.retry_failed()
+            else:
+                # Custom processing for just loose files
+                batch_start_time = time.time()
+                processed_count = 0
+                skipped_count = 0
+                failed_count = 0
+                
+                for idx, wav_file in enumerate(wav_files, 1):
+                    if not no_skip and transcriber._is_already_processed(wav_file):
+                        skipped_count += 1
+                        transcriber.logger.info(f"[{idx}/{len(wav_files)}] Skipping: {wav_file.name}")
+                        continue
+                    
+                    transcriber.logger.info(f"[{idx}/{len(wav_files)}] Processing: {wav_file.name}")
+                    result = transcriber.transcribe_file(wav_file)
+                    file_hash = transcriber._get_file_hash(wav_file)
+                    
+                    if result["success"]:
+                        transcriber.progress["completed"][file_hash] = {
+                            "filename": wav_file.name,
+                            "path": str(wav_file),
+                            "processed_at": datetime.now().isoformat(),
+                            "duration_seconds": result["duration"],
+                            "text_length": result["text_length"],
+                        }
+                        processed_count += 1
+                    else:
+                        transcriber.progress["failed"][file_hash] = {
+                            "filename": wav_file.name,
+                            "path": str(wav_file),
+                            "failed_at": datetime.now().isoformat(),
+                            "error": result["error"],
+                        }
+                        failed_count += 1
+                    
+                    transcriber._save_progress()
+                
+                batch_elapsed = time.time() - batch_start_time
+                transcriber.logger.info("=" * 60)
+                transcriber.logger.info(f"Loose files complete: {processed_count} processed, {skipped_count} skipped, {failed_count} failed")
+                transcriber.logger.info(f"Time: {batch_elapsed:.2f} seconds")
+                transcriber.logger.info("=" * 60)
+            
+            transcriber.generate_report()
+
+
 def main():
-    # Ensure input directory exists
     script_dir = Path(__file__).parent
-    default_input = script_dir / "input_files"
-    default_input.mkdir(exist_ok=True)
+    input_files_dir = script_dir / "input_files"
+    output_files_dir = script_dir / "output_files"
+    
+    # Ensure directories exist
+    input_files_dir.mkdir(exist_ok=True)
+    output_files_dir.mkdir(exist_ok=True)
     
     parser = argparse.ArgumentParser(
-        description="Batch transcribe WAV files using Whisper"
+        description="Batch transcribe audio files using Whisper"
     )
     parser.add_argument(
         "input_folder",
         nargs="?",
-        default=str(default_input),
-        help="Path to folder containing WAV files (default: ./input_files)"
+        default=None,
+        help="Path to folder containing audio files (default: processes all folders in input_files/)"
     )
     parser.add_argument(
         "-o", "--output",
-        help="Output directory (default: <input_folder>_transcriptions)",
+        help="Output directory (default: output_files/<folder>_transcribed)",
         default=None
     )
     parser.add_argument(
         "-m", "--model",
         help="Whisper model size (tiny, base, small, medium, large)",
         default="base"
-    )
-    parser.add_argument(
-        "-r", "--recursive",
-        help="Search for WAV files recursively in subdirectories",
-        action="store_true"
     )
     parser.add_argument(
         "--retry",
@@ -331,21 +426,30 @@ def main():
 
     args = parser.parse_args()
 
-    transcriber = WhisperBatchTranscriber(
-        input_dir=args.input_folder,
-        output_dir=args.output,
-        model_size=args.model,
-    )
-
-    if args.retry:
-        transcriber.retry_failed()
+    # If no input folder specified, process everything in input_files/
+    if args.input_folder is None:
+        process_input_files(script_dir, output_files_dir, args.model, args.retry, args.no_skip)
     else:
-        transcriber.process_batch(
-            skip_completed=not args.no_skip,
-            recursive=args.recursive
+        # Process specific folder
+        input_path = Path(args.input_folder)
+        
+        if args.output:
+            output_path = Path(args.output)
+        else:
+            output_path = output_files_dir / f"{input_path.name}_transcribed"
+        
+        transcriber = WhisperBatchTranscriber(
+            input_dir=str(input_path),
+            output_dir=str(output_path),
+            model_size=args.model,
         )
 
-    transcriber.generate_report()
+        if args.retry:
+            transcriber.retry_failed()
+        else:
+            transcriber.process_batch(skip_completed=not args.no_skip)
+
+        transcriber.generate_report()
 
 
 if __name__ == "__main__":
